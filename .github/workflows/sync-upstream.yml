@@ -1,0 +1,126 @@
+name: Sync Upstream
+
+# 每天把上游 TriDefender/zcode-api 同步到本 fork 的 master。
+#
+# 覆盖范围：只做代码同步，不构建、不发版、不触发 build.yml。
+# 本仓库 main 上唯一的自有提交就是本文件（sync-upstream.yml）。
+# 策略：把本地提交 rebase 到上游之上，main 始终等于「上游历史 + 1 个自有提交」，
+#       不产生 merge commit，也不会和上游形成分叉。
+# 若 rebase 冲突 -> 直接失败并保留原状，不会破坏任何东西。
+#
+# 关于 token：默认用 GITHUB_TOKEN。它推送不会被 GitHub 计入 push 事件，
+# 因此不会触发 build.yml（正合「只要同步」的本意）。代价是上游若改动了
+# .github/workflows/ 下的文件会推送失败；那时再配 SYNC_TOKEN（带 workflow
+# scope 的 PAT），但注意 PAT 推送会正常触发 build.yml。
+
+on:
+  schedule:
+    # UTC 22:15 == 北京时间 06:15
+    - cron: '15 22 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force: discard local commits and hard-reset main to upstream'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: TriDefender/zcode-api
+  UPSTREAM_BRANCH: master
+
+jobs:
+  sync:
+    name: Sync from upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v7
+        with:
+          ref: master
+          fetch-depth: 0
+          # 配了 SYNC_TOKEN 就用它：只有带 workflow scope 的 token 才能推送
+          # .github/workflows/** 的改动（上游改了 build.yml 时必需）
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Compare with upstream
+        id: cmp
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" \
+            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+          behind=$(git rev-list --count "HEAD..upstream/${UPSTREAM_BRANCH}")
+          ahead=$(git rev-list --count "upstream/${UPSTREAM_BRANCH}..HEAD")
+
+          echo "behind=${behind}" >> "$GITHUB_OUTPUT"
+          echo "ahead=${ahead}" >> "$GITHUB_OUTPUT"
+
+          echo "fork HEAD : $(git rev-parse --short HEAD)"
+          echo "upstream  : $(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")"
+          echo "behind=${behind}  ahead=${ahead}"
+
+      - name: Nothing to do
+        if: steps.cmp.outputs.behind == '0'
+        run: echo "Already up to date with upstream/${UPSTREAM_BRANCH}."
+
+      - name: Rebase onto upstream
+        if: steps.cmp.outputs.behind != '0'
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          if [ "${FORCE}" = "true" ]; then
+            echo "::warning::force=true，丢弃 main 上的本地提交，直接对齐上游"
+            git reset --hard "upstream/${UPSTREAM_BRANCH}"
+          else
+            if ! git rebase "upstream/${UPSTREAM_BRANCH}"; then
+              git rebase --abort || true
+              echo "::error::rebase 冲突，已回滚。请手动解决，或手动运行本 workflow 并勾选 force 直接对齐上游。"
+              exit 1
+            fi
+            echo "rebase 完成，main = 上游 + $(git rev-list --count "upstream/${UPSTREAM_BRANCH}..HEAD") 个自有提交"
+          fi
+
+      - name: Push
+        id: push
+        if: steps.cmp.outputs.behind != '0'
+        run: |
+          # rebase 改写了 commit sha，必须 force；--force-with-lease 会在
+          # 期间有人推送过时拒绝覆盖，比 --force 安全
+          if ! git push --force-with-lease origin "HEAD:${UPSTREAM_BRANCH}" >push.log 2>&1; then
+            cat push.log
+            if grep -q 'refusing to allow' push.log; then
+              echo "::error::上游改动了 .github/workflows/ 下的文件，GITHUB_TOKEN 无权推送。请新增仓库 secret SYNC_TOKEN（classic PAT，勾选 repo + workflow）。"
+            else
+              echo "::error::推送失败，见上方日志"
+            fi
+            exit 1
+          fi
+          cat push.log
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Upstream sync"
+            echo ""
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| upstream | \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\` |"
+            echo "| behind | ${{ steps.cmp.outputs.behind }} |"
+            echo "| ahead (本地自有提交) | ${{ steps.cmp.outputs.ahead }} |"
+            echo "| pushed | ${{ steps.push.outputs.changed || 'no' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
